@@ -1,0 +1,21 @@
+.{
+    .name = .zoto,
+
+    .version = "0.0.0",
+    .fingerprint = 0xf013d3c28c031d12,
+
+    .minimum_zig_version = "0.15.1",
+
+    .dependencies = .{
+        .zig_objc = .{
+            .url = "git+https://github.com/pluiedev/zig-objc?ref=pluie/jj-symywnwnnqvm#06b0c561bdec1025f6802830eaf6e3da12f6d986",
+            .hash = "zig_objc-0.0.0-Ir_Sp8oTAQBZb591njJzn5CGSrg4Bg8X5tbXZzdaHU9x",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
