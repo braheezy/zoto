@@ -26,6 +26,7 @@ pub const Mux = struct {
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
     shutdown: bool = false,
+    thread: ?std.Thread = null,
 
     pub fn init(allocator: std.mem.Allocator, sample_rate: u32, channel_count: u8, format: Format) !*Mux {
         const self = try allocator.create(Mux);
@@ -36,8 +37,7 @@ pub const Mux = struct {
             .allocator = allocator,
             .players = std.array_list.Managed(*Player).init(allocator),
         };
-        const thread = try std.Thread.spawn(.{}, muxLoop, .{self});
-        thread.detach();
+        self.thread = try std.Thread.spawn(.{}, muxLoop, .{self});
         return self;
     }
 
@@ -48,8 +48,10 @@ pub const Mux = struct {
         self.condition.signal();
         self.mutex.unlock();
 
-        // Give the loop time to exit
-        std.Thread.sleep(std.time.ns_per_ms * 10);
+        // Wait for the thread to finish properly
+        if (self.thread) |thread| {
+            thread.join();
+        }
 
         self.players.deinit();
         self.allocator.destroy(self);
@@ -267,6 +269,9 @@ pub const Player = struct {
     }
 
     pub fn deinit(self: *Player) void {
+        // Remove from mux player list first
+        self.mux.removePlayer(self);
+
         self.buffer.clearAndFree();
         if (self.buffer_pool) |*p| {
             p.deinit();
