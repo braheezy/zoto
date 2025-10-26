@@ -1,7 +1,7 @@
 .{
     .name = .zoto,
 
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0xf013d3c28c031d12,
 
     .minimum_zig_version = "0.15.1",
