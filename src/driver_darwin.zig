@@ -87,6 +87,16 @@ extern "c" fn AudioQueuePause(
     aq: AudioQueueRef,
 ) i32;
 
+extern "c" fn AudioQueueStop(
+    aq: AudioQueueRef,
+    immediate: bool,
+) i32;
+
+extern "c" fn AudioQueueDispose(
+    aq: AudioQueueRef,
+    immediate: bool,
+) i32;
+
 fn newAudioQueue(allocator: std.mem.Allocator, sample_rate: u32, channel_count: u32, one_buffer_size_in_bytes: u32) !struct { AudioQueueRef, []AudioQueueBufferRef } {
     const description = AudioStreamBasicDescription{
         .sample_rate = @floatFromInt(sample_rate),
@@ -191,8 +201,16 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
-        // Give the context time to clean up properly
-        std.Thread.sleep(std.time.ns_per_ms * 100);
+        // Stop the audio queue immediately to prevent new callbacks from being queued
+        _ = AudioQueueStop(self.audio_queue, true);
+
+        // Give any in-flight callbacks time to complete
+        std.Thread.sleep(std.time.ns_per_ms * 50);
+
+        // Dispose of the audio queue and wait for cleanup
+        _ = AudioQueueDispose(self.audio_queue, false);
+
+        // Now it's safe to clean up other resources
         self.mux.deinit();
         self.unqueued_buffers.deinit();
         if (self.allocated_buffers) |buffers| {
