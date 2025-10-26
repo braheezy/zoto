@@ -132,3 +132,6 @@ const volume = player.getVolume();
 // Close player when done
 try player.close();
 ```
+
+### Detailed Example
+See the [player example in `zigaudio`](https://github.com/braheezy/zigaudio/blob/f86cb9b9cf0cc938965334a2eb73585e3064e96d/examples/player/main.zig).
