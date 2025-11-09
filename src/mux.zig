@@ -28,6 +28,8 @@ pub const Mux = struct {
     condition: if (builtin.single_threaded) struct {} else std.Thread.Condition = .{},
     shutdown: bool = false,
     thread: if (builtin.single_threaded) ?void else ?std.Thread = null,
+    ready: bool = false,
+    err: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, sample_rate: u32, channel_count: u8, format: Format) !*Mux {
         const self = try allocator.create(Mux);
@@ -143,6 +145,48 @@ pub const Mux = struct {
         if (!builtin.single_threaded) {
             self.condition.signal();
         }
+    }
+
+    pub fn waitForReady(self: *Mux) void {
+        if (builtin.single_threaded) {
+            return;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (!self.ready) {
+            self.condition.wait(&self.mutex);
+        }
+    }
+
+    pub fn setReady(self: *Mux, ready: bool) void {
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+        }
+
+        self.ready = ready;
+
+        if (!builtin.single_threaded) {
+            self.condition.signal();
+        }
+    }
+
+    pub fn getErr(self: *Mux) ?anyerror {
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+        }
+        return self.err;
+    }
+
+    pub fn setErr(self: *Mux, err: ?anyerror) void {
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+        }
+        self.err = err;
     }
 
     fn defaultBufferSize(self: *Mux) usize {

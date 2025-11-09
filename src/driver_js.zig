@@ -53,16 +53,10 @@ extern "env" fn js_create_script_processor_callback(ctx_ptr: usize, func_name: [
 // Called when the worklet processor requests more data (sends null message)
 export fn zoto_worklet_onmessage(ctx_ptr: usize) void {
     const ctx: *Context = @ptrFromInt(ctx_ptr);
-    if (!builtin.single_threaded) {
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
-    }
 
     if (ctx.buf32) |buf| {
         ctx.mux.readFloat32s(buf) catch |err| {
-            if (ctx.err == null) {
-                ctx.err = err;
-            }
+            ctx.mux.setErr(err);
             return;
         };
 
@@ -88,16 +82,10 @@ export fn zoto_worklet_onmessage(ctx_ptr: usize) void {
 
 export fn zoto_script_processor_callback(ctx_ptr: usize, output_buffer: JSValue) void {
     const ctx: *Context = @ptrFromInt(ctx_ptr);
-    if (!builtin.single_threaded) {
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
-    }
 
     if (ctx.buf32) |buf| {
         ctx.mux.readFloat32s(buf) catch |err| {
-            if (ctx.err == null) {
-                ctx.err = err;
-            }
+            ctx.mux.setErr(err);
             return;
         };
 
@@ -148,10 +136,6 @@ export fn zoto_script_processor_callback(ctx_ptr: usize, output_buffer: JSValue)
 
 export fn zoto_setup_after_user_interaction(ctx_ptr: usize) void {
     const ctx: *Context = @ptrFromInt(ctx_ptr);
-    if (!builtin.single_threaded) {
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
-    }
 
     // Get AudioContext class (first JavaScript call, but after user interaction)
     if (ctx.audio_context_class == 0) {
@@ -160,7 +144,7 @@ export fn zoto_setup_after_user_interaction(ctx_ptr: usize) void {
             const webkit_audio_context_class = js_global_get("webkitAudioContext");
             if (js_value_is_null(webkit_audio_context_class) or !js_value_truthy(webkit_audio_context_class)) {
                 js_value_release(audio_context_class);
-                ctx.err = error.AudioContextNotFound;
+                ctx.mux.setErr(error.AudioContextNotFound);
                 return;
             }
             js_value_release(audio_context_class);
@@ -195,7 +179,7 @@ export fn zoto_setup_after_user_interaction(ctx_ptr: usize) void {
         js_value_release(options);
     }
 
-    if (!ctx.ready and ctx.audio_context != 0) {
+    if (!ctx.mux.ready and ctx.audio_context != 0) {
         const resume_promise = js_value_call(ctx.audio_context, "resume", &[_]JSValue{}, 0);
         _ = js_promise_then(resume_promise, ctx.on_resume_success);
         js_value_release(resume_promise);
@@ -204,12 +188,8 @@ export fn zoto_setup_after_user_interaction(ctx_ptr: usize) void {
 
 export fn zoto_on_event_fired(ctx_ptr: usize) void {
     const ctx: *Context = @ptrFromInt(ctx_ptr);
-    if (!builtin.single_threaded) {
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
-    }
 
-    if (!ctx.ready and ctx.audio_context != 0) {
+    if (!ctx.mux.ready and ctx.audio_context != 0) {
         const resume_promise = js_value_call(ctx.audio_context, "resume", &[_]JSValue{}, 0);
         _ = js_promise_then(resume_promise, ctx.on_resume_success);
         js_value_release(resume_promise);
@@ -218,31 +198,24 @@ export fn zoto_on_event_fired(ctx_ptr: usize) void {
 
 export fn zoto_on_resume_success(ctx_ptr: usize) void {
     const ctx: *Context = @ptrFromInt(ctx_ptr);
-    if (!builtin.single_threaded) {
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
-    }
 
     // Set up audio worklet/script processor now (after user interaction, won't block)
     if (!ctx.audio_setup_done and ctx.deferred_buffer_size > 0) {
         const audio_worklet = js_value_get(ctx.audio_context, "audioWorklet");
         if (js_value_truthy(audio_worklet)) {
             ctx.setupAudioWorklet(ctx.allocator, ctx.deferred_buffer_size, ctx.deferred_channel_count) catch |err| {
-                ctx.err = err;
+                ctx.mux.setErr(err);
             };
         } else {
             ctx.setupScriptProcessorNode(ctx.allocator, ctx.deferred_buffer_size, ctx.deferred_channel_count) catch |err| {
-                ctx.err = err;
+                ctx.mux.setErr(err);
             };
         }
         js_value_release(audio_worklet);
         ctx.audio_setup_done = true;
     }
 
-    ctx.ready = true;
-    if (!builtin.single_threaded) {
-        ctx.condition.signal();
-    }
+    ctx.mux.setReady(true);
 
     // Remove event listeners
     const document = js_global_get("document");
@@ -275,10 +248,6 @@ pub const Context = struct {
     worklet_port: JSValue = 0,
     on_event_fired: JSValue = 0,
     on_resume_success: JSValue = 0,
-    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = if (builtin.single_threaded) .{} else .{},
-    condition: if (builtin.single_threaded) struct {} else std.Thread.Condition = if (builtin.single_threaded) .{} else .{},
-    ready: bool = false,
-    err: ?anyerror = null,
     buf32: ?[]f32 = null,
     ch_buf32: ?[]([]f32) = null, // Per-channel buffers for ScriptProcessorNode
     deferred_buffer_size: u32 = 0,
@@ -419,10 +388,6 @@ pub const Context = struct {
 
     export fn zoto_on_worklet_module_loaded(ctx_ptr: usize) void {
         const ctx: *Context = @ptrFromInt(ctx_ptr);
-        if (!builtin.single_threaded) {
-            ctx.mutex.lock();
-            defer ctx.mutex.unlock();
-        }
 
         const audio_worklet_node_class = js_global_get("AudioWorkletNode");
         defer js_value_release(audio_worklet_node_class);
@@ -558,28 +523,11 @@ pub const Context = struct {
     }
 
     pub fn waitForReady(self: *Context) void {
-        // In single-threaded WASM/browser mode, don't block
-        // The audio context will be ready after user interaction (handled by JS callbacks)
-        // Blocking here would freeze the browser tab
-        if (builtin.single_threaded) {
-            return; // Don't wait - ready will be set asynchronously via JS callbacks
-        }
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (!self.ready) {
-            self.condition.wait(&self.mutex);
-        }
+        self.mux.waitForReady();
     }
 
     pub fn pause(self: *Context) !void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
-
-        if (self.err) |stored_err| return stored_err;
+        if (self.mux.getErr()) |err| return err;
 
         if (self.audio_context != 0) {
             const res = js_value_call(self.audio_context, "suspend", &[_]JSValue{}, 0);
@@ -590,12 +538,7 @@ pub const Context = struct {
     }
 
     pub fn play(self: *Context) !void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
-
-        if (self.err) |stored_err| return stored_err;
+        if (self.mux.getErr()) |err| return err;
 
         if (self.audio_context != 0) {
             const res = js_value_call(self.audio_context, "resume", &[_]JSValue{}, 0);
@@ -606,11 +549,7 @@ pub const Context = struct {
     }
 
     pub fn getErr(self: *Context) ?anyerror {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
-        return self.err;
+        return self.mux.getErr();
     }
 
     pub fn newPlayer(self: *Context, reader: *std.Io.Reader) !*Player {
