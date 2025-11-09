@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const Format = @import("mux.zig").Format;
 
 var context_created: bool = false;
-var context_creation_mutex: std.Thread.Mutex = .{};
+var context_creation_mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = if (builtin.single_threaded) .{} else .{};
 
 pub const Options = struct {
     sample_rate: u32,
@@ -16,12 +16,15 @@ pub const Context = switch (builtin.os.tag) {
     .macos => @import("driver_darwin.zig").Context,
     .linux => @import("driver_unix.zig").Context,
     .windows => @import("driver_windows.zig").Context,
+    .wasi, .freestanding => @import("driver_js.zig").Context, // Both WASI and freestanding use JS driver for browser
     else => @compileError("Unsupported platform"),
 };
 
 pub fn newContext(allocator: std.mem.Allocator, options: Options) !*Context {
-    context_creation_mutex.lock();
-    defer context_creation_mutex.unlock();
+    if (!builtin.single_threaded) {
+        context_creation_mutex.lock();
+        defer context_creation_mutex.unlock();
+    }
 
     if (context_created) {
         return error.ContextAlreadyCreated;

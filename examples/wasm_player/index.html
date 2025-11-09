@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zoto WASM Audio Player</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            margin-top: 0;
+            color: #333;
+        }
+        .file-input-wrapper {
+            margin: 20px 0;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        .file-label {
+            display: inline-block;
+            padding: 12px 24px;
+            background: #007bff;
+            color: white;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .file-label:hover {
+            background: #0056b3;
+        }
+        .file-name {
+            margin-left: 10px;
+            color: #666;
+        }
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-play {
+            background: #28a745;
+            color: white;
+        }
+        .btn-play:hover:not(:disabled) {
+            background: #218838;
+        }
+        .btn-pause {
+            background: #ffc107;
+            color: #333;
+        }
+        .btn-pause:hover:not(:disabled) {
+            background: #e0a800;
+        }
+        .btn-stop {
+            background: #dc3545;
+            color: white;
+        }
+        .btn-stop:hover:not(:disabled) {
+            background: #c82333;
+        }
+        .volume-control {
+            margin: 20px 0;
+        }
+        .volume-control label {
+            display: block;
+            margin-bottom: 5px;
+            color: #666;
+        }
+        .volume-slider {
+            width: 100%;
+            max-width: 300px;
+        }
+        .status {
+            margin: 20px 0;
+            padding: 10px;
+            background: #e9ecef;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .error {
+            color: #dc3545;
+            background: #f8d7da;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .info {
+            background: #d1ecf1;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            color: #0c5460;
+        }
+        .btn-start {
+            width: 100%;
+            margin-bottom: 15px;
+            background: #6f42c1;
+            color: white;
+            padding: 12px 20px;
+        }
+        .btn-start:hover:not(:disabled) {
+            background: #59309b;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 Zoto WASM Audio Player</h1>
+
+        <div class="info">
+            <strong>Note:</strong> This player expects raw PCM audio data (WAV format recommended).
+            The audio will be played at 44100 Hz, stereo, 16-bit signed integer format.
+        </div>
+
+        <button id="enable-audio" class="btn-start">Enable Audio</button>
+
+        <div class="file-input-wrapper">
+            <label for="file-input" class="file-label">Choose Audio File</label>
+            <input type="file" id="file-input" accept="audio/*,.wav">
+            <span class="file-name" id="file-name">No file selected</span>
+        </div>
+
+        <div class="controls">
+            <button id="play-btn" class="btn-play" disabled>Play</button>
+            <button id="pause-btn" class="btn-pause" disabled>Pause</button>
+            <button id="stop-btn" class="btn-stop" disabled>Stop</button>
+        </div>
+
+        <div class="volume-control">
+            <label for="volume-slider">Volume: <span id="volume-value">100</span>%</label>
+            <input type="range" id="volume-slider" class="volume-slider" min="0" max="100" value="100">
+        </div>
+
+        <div class="status" id="status">Initializing...</div>
+        <div id="error-container"></div>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+
+</body>
+</html>
