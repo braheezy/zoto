@@ -3,11 +3,10 @@ const builtin = @import("builtin");
 
 const Buffer = @import("buffer.zig").Buffer;
 
-const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
 pub const Pool = struct {
-    mutex: Mutex,
+    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = .{},
     available: usize,
     allocator: Allocator,
     buffer_size: usize,
@@ -41,11 +40,11 @@ pub const Pool = struct {
     pub fn acquireWithAllocator(self: *Pool, dyn_allocator: Allocator) !*Buffer {
         const buffers = self.buffers;
 
-        self.mutex.lock();
+        if (!builtin.single_threaded) self.mutex.lock();
         const available = self.available;
         if (available == 0) {
             // dont hold the lock over factory
-            self.mutex.unlock();
+            if (!builtin.single_threaded) self.mutex.unlock();
 
             const allocator = self.allocator;
             const sb = try allocator.create(Buffer);
@@ -56,19 +55,19 @@ pub const Pool = struct {
         const index = available - 1;
         const sb = buffers[index];
         self.available = index;
-        self.mutex.unlock();
+        if (!builtin.single_threaded) self.mutex.unlock();
         sb._da = dyn_allocator;
         return sb;
     }
 
     pub fn release(self: *Pool, sb: *Buffer) void {
         sb.reset();
-        self.mutex.lock();
+        if (!builtin.single_threaded) self.mutex.lock();
 
         var buffers = self.buffers;
         const available = self.available;
         if (available == buffers.len) {
-            self.mutex.unlock();
+            if (!builtin.single_threaded) self.mutex.unlock();
             const allocator = self.allocator;
             sb.deinit();
             allocator.destroy(sb);
@@ -76,6 +75,6 @@ pub const Pool = struct {
         }
         buffers[available] = sb;
         self.available = available + 1;
-        self.mutex.unlock();
+        if (!builtin.single_threaded) self.mutex.unlock();
     }
 };

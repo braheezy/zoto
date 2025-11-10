@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Pool = @import("pool.zig").Pool;
 const Buffer = @import("buffer.zig").Buffer;
 const Reader = std.Io.Reader;
@@ -23,10 +24,12 @@ pub const Mux = struct {
     format: Format,
     players: std.array_list.Managed(*Player),
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = .{},
+    condition: if (builtin.single_threaded) struct {} else std.Thread.Condition = .{},
     shutdown: bool = false,
-    thread: ?std.Thread = null,
+    thread: if (builtin.single_threaded) ?void else ?std.Thread = null,
+    ready: bool = false,
+    err: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, sample_rate: u32, channel_count: u8, format: Format) !*Mux {
         const self = try allocator.create(Mux);
@@ -37,20 +40,29 @@ pub const Mux = struct {
             .allocator = allocator,
             .players = std.array_list.Managed(*Player).init(allocator),
         };
-        self.thread = try std.Thread.spawn(.{}, muxLoop, .{self});
+        // For single-threaded WASM, don't spawn a thread - process synchronously in readFloat32s
+        if (builtin.single_threaded) {
+            self.thread = null;
+        } else {
+            self.thread = try std.Thread.spawn(.{}, muxLoop, .{self});
+        }
         return self;
     }
 
     pub fn deinit(self: *Mux) void {
-        // Signal shutdown and wake up the mux loop
-        self.mutex.lock();
-        self.shutdown = true;
-        self.condition.signal();
-        self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            // Signal shutdown and wake up the mux loop
+            self.mutex.lock();
+            self.shutdown = true;
+            self.condition.signal();
+            self.mutex.unlock();
 
-        // Wait for the thread to finish properly
-        if (self.thread) |thread| {
-            thread.join();
+            // Wait for the thread to finish properly
+            if (self.thread) |thread| {
+                thread.join();
+            }
+        } else {
+            self.shutdown = true;
         }
 
         self.players.deinit();
@@ -71,8 +83,12 @@ pub const Mux = struct {
     }
 
     pub fn addPlayer(self: *Mux, player: *Player) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         // Check if player is already in the list to prevent duplicates
         for (self.players.items) |p| {
@@ -83,15 +99,23 @@ pub const Mux = struct {
         }
 
         try self.players.append(player);
-        self.condition.signal();
+        if (!builtin.single_threaded) {
+            self.condition.signal();
+        }
     }
 
     pub fn readFloat32s(self: *Mux, dst: []f32) !void {
-        self.mutex.lock();
+        // For single-threaded WASM, process mux loop work synchronously here
+        // (like oto's driver_js.go which calls mux.ReadFloat32s directly from JS callbacks)
+        if (builtin.single_threaded) {
+            // Process players: read from sources to buffers
+            for (self.players.items) |player| {
+                _ = try player.readSourceToBuffer();
+            }
+        }
 
         const players = try self.players.clone();
         defer players.deinit();
-        self.mutex.unlock();
 
         @memset(dst, 0);
 
@@ -99,12 +123,18 @@ pub const Mux = struct {
             _ = player.readBufferAndAdd(dst);
         }
 
-        self.condition.signal();
+        if (!builtin.single_threaded) {
+            self.condition.signal();
+        }
     }
 
     pub fn removePlayer(self: *Mux, player: *Player) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         for (self.players.items, 0..) |p, i| {
             if (p == player) {
@@ -112,7 +142,51 @@ pub const Mux = struct {
                 break;
             }
         }
-        self.condition.signal();
+        if (!builtin.single_threaded) {
+            self.condition.signal();
+        }
+    }
+
+    pub fn waitForReady(self: *Mux) void {
+        if (builtin.single_threaded) {
+            return;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (!self.ready) {
+            self.condition.wait(&self.mutex);
+        }
+    }
+
+    pub fn setReady(self: *Mux, ready: bool) void {
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+        }
+
+        self.ready = ready;
+
+        if (!builtin.single_threaded) {
+            self.condition.signal();
+        }
+    }
+
+    pub fn getErr(self: *Mux) ?anyerror {
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+        }
+        return self.err;
+    }
+
+    pub fn setErr(self: *Mux, err: ?anyerror) void {
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+        }
+        self.err = err;
     }
 
     fn defaultBufferSize(self: *Mux) usize {
@@ -122,6 +196,10 @@ pub const Mux = struct {
     }
 
     fn wait(self: *Mux) void {
+        if (builtin.single_threaded) {
+            // Single-threaded: no waiting needed
+            return;
+        }
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -197,16 +275,25 @@ pub const Player = struct {
     buffer: std.array_list.Managed(u8),
     eof: bool = false,
     buffer_size: usize,
-    mutex: std.Thread.Mutex = .{},
+    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = if (builtin.single_threaded) .{} else .{},
 
     pub fn play(self: *Player) !void {
-        const thread = try std.Thread.spawn(.{}, Player.playThread, .{self});
-        thread.join();
+        if (builtin.single_threaded) {
+            // Single-threaded: call directly (like oto's WASM driver)
+            try self.playImpl();
+        } else {
+            const thread = try std.Thread.spawn(.{}, Player.playThread, .{self});
+            thread.join();
+        }
     }
 
     pub fn pause(self: *Player) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         if (self.state != .play) {
             return;
@@ -215,8 +302,12 @@ pub const Player = struct {
     }
 
     pub fn setBufferSize(self: *Player, buffer_size: usize) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         const original_size = self.buffer_size;
         self.buffer_size = buffer_size;
@@ -224,32 +315,47 @@ pub const Player = struct {
             self.buffer_size = self.mux.defaultBufferSize();
         }
         if (original_size != self.buffer_size) {
-            if (self.buffer_pool) |p| p.deinit();
-            self.buffer_pool = null;
+            self.freeBufferPool();
         }
     }
 
     pub fn reset(self: *Player) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         self.resetImpl();
     }
 
     pub fn isPlaying(self: *Player) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         return self.state == .play;
     }
 
     pub fn getVolume(self: *Player) f64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         return self.volume;
     }
 
     pub fn setVolume(self: *Player, volume: f64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         self.volume = volume;
         if (self.state != .play) {
             self.previous_volume = volume;
@@ -257,14 +363,22 @@ pub const Player = struct {
     }
 
     pub fn bufferedSize(self: *Player) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         return self.buffer.items.len;
     }
 
     pub fn close(self: *Player) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         try self.closeImpl();
     }
 
@@ -273,16 +387,18 @@ pub const Player = struct {
         self.mux.removePlayer(self);
 
         self.buffer.clearAndFree();
-        if (self.buffer_pool) |*p| {
-            p.deinit();
-        }
+        self.freeBufferPool();
         self.mux.allocator.destroy(self);
     }
 
     fn playThread(ctx: *anyopaque) !void {
         var self: *Player = @ptrCast(@alignCast(ctx));
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
         try self.playImpl();
     }
 
@@ -334,9 +450,7 @@ pub const Player = struct {
         }
         self.state = .closed;
         self.buffer.clearAndFree();
-        if (self.buffer_pool) |*p| {
-            p.deinit();
-        }
+        self.freeBufferPool();
     }
 
     fn addToPlayers(self: *Player) !void {
@@ -358,8 +472,12 @@ pub const Player = struct {
     }
 
     fn canReadSourceToBuffer(self: *Player) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         if (self.eof) {
             return false;
@@ -369,8 +487,12 @@ pub const Player = struct {
     }
 
     fn readBufferAndAdd(self: *Player, dst: []f32) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         if (self.state != .play) {
             return 0;
@@ -440,8 +562,12 @@ pub const Player = struct {
     }
 
     fn readSourceToBuffer(self: *Player) !usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!builtin.single_threaded) {
+            self.mutex.lock();
+        }
+        defer if (!builtin.single_threaded) {
+            self.mutex.unlock();
+        };
 
         if (self.state == .closed) {
             return 0;
@@ -477,5 +603,12 @@ pub const Player = struct {
 
         const buffer = try self.buffer_pool.?.acquire();
         return buffer;
+    }
+
+    fn freeBufferPool(self: *Player) void {
+        if (self.buffer_pool) |*p| {
+            p.deinit();
+            self.buffer_pool = null;
+        }
     }
 };
