@@ -431,11 +431,6 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
         return;
     };
 
-    // setNotificationHandler() catch |err| {
-    //     std.log.err("setNotificationHandler failed: {any}", .{err});
-    //     return;
-    // };
-
     var retry_count: i32 = 0;
     while (true) {
         const osstatus = AudioQueueStart(ctx.audio_queue, null);
@@ -462,60 +457,6 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
     // Start the main audio processing loop
     ctx.loop();
 }
-
-// Placeholder callback functions for sleep/wake notifications
-fn setGlobalPause(self: objc.Object, _: objc.SEL, notification: objc.Object) callconv(.c) void {
-    _ = self;
-    _ = notification;
-    context.suspendPlay();
-}
-
-fn setGlobalResume(self: objc.Object, _: objc.SEL, notification: objc.Object) callconv(.c) void {
-    _ = self;
-    _ = notification;
-    context.resumePlay();
-}
-
-// fn setNotificationHandler() !void {
-//     const ZtoNotificationObserver = setup: {
-//         const My_Class = objc.allocateClassPair(objc.getClass("NSObject").?, "ZtoNotificationObserver").?;
-//         defer objc.registerClassPair(My_Class);
-//         try My_Class.addMethod("receiveSleepNote", setGlobalPause);
-//         break :setup My_Class;
-//     };
-
-//     const NSObject = objc.getClass("NSObject") orelse return error.NSObjectNotFound;
-//     const NSWorkspace = objc.getClass("NSWorkspace") orelse return error.NSWorkspaceNotFound;
-//     const NSString = objc.getClass("NSString") orelse return error.NSStringNotFound;
-
-//     // Create notification name strings
-//     const sleepNotificationName = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"NSWorkspaceWillSleepNotification"});
-//     const wakeNotificationName = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"NSWorkspaceDidWakeNotification"});
-
-//     // Get shared workspace and notification center
-//     const sharedWorkspace = NSWorkspace.msgSend(objc.Object, "sharedWorkspace", .{});
-//     const notificationCenter = sharedWorkspace.msgSend(objc.Object, "notificationCenter", .{});
-
-//     // Create observer object (using NSObject as base for simplicity)
-//     const observer = NSObject.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
-
-//     // Register for sleep notification
-//     // Note: This is a simplified approach. Full implementation would require proper method registration
-//     _ = notificationCenter.msgSend(objc.Object, "addObserver:selector:name:object:", .{
-//         observer,
-//         @intFromPtr(&setGlobalPause),
-//         sleepNotificationName,
-//         @as(objc.Object, @enumFromInt(0)),
-//     });
-
-//     // Register for wake notification
-//     _ = notificationCenter.msgSend(objc.Object, "addObserver:selector:name:object:", .{
-//         observer,
-//         @intFromPtr(&setGlobalResume),
-//         wakeNotificationName,
-//         @as(objc.Object, @enumFromInt(0)),
-//     });
-// }
 
 fn render(user_data: ?*anyopaque, aq: AudioQueueRef, buffer: AudioQueueBufferRef) callconv(.c) void {
     _ = user_data;
