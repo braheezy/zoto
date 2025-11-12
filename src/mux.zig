@@ -4,6 +4,8 @@ const Pool = @import("pool.zig").Pool;
 const Buffer = @import("buffer.zig").Buffer;
 const Reader = std.Io.Reader;
 
+const buffer_pool_initial_size: u16 = 4;
+
 pub const Format = enum {
     float32_le,
     uint8,
@@ -23,6 +25,7 @@ pub const Mux = struct {
     channel_count: u8,
     format: Format,
     players: std.array_list.Managed(*Player),
+    buffer_pool: Pool,
     allocator: std.mem.Allocator,
     mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = .{},
     condition: if (builtin.single_threaded) struct {} else std.Thread.Condition = .{},
@@ -39,6 +42,12 @@ pub const Mux = struct {
             .format = format,
             .allocator = allocator,
             .players = std.array_list.Managed(*Player).init(allocator),
+            .buffer_pool = undefined,
+        };
+        self.buffer_pool = Pool.init(self.allocator, buffer_pool_initial_size, self.defaultBufferSize()) catch |err| {
+            self.players.deinit();
+            self.allocator.destroy(self);
+            return err;
         };
         // For single-threaded WASM, don't spawn a thread - process synchronously in readFloat32s
         if (builtin.single_threaded) {
@@ -66,6 +75,7 @@ pub const Mux = struct {
         }
 
         self.players.deinit();
+        self.buffer_pool.deinit();
         self.allocator.destroy(self);
     }
 
@@ -222,6 +232,18 @@ pub const Mux = struct {
         }
         return true;
     }
+
+    fn acquireBuffer(self: *Mux, size: usize) !*Buffer {
+        const buf = try self.buffer_pool.acquire();
+        if (buf.buf.len < size) {
+            try buf.ensureTotalCapacity(size);
+        }
+        return buf;
+    }
+
+    fn releaseBuffer(self: *Mux, buffer: *Buffer) void {
+        self.buffer_pool.release(buffer);
+    }
 };
 
 fn muxLoop(self: *Mux) !void {
@@ -271,7 +293,6 @@ pub const Player = struct {
     previous_volume: f64,
     volume: f64,
     state: PlayerState = .paused,
-    buffer_pool: ?Pool = null,
     buffer: std.array_list.Managed(u8),
     eof: bool = false,
     buffer_size: usize,
@@ -309,13 +330,9 @@ pub const Player = struct {
             self.mutex.unlock();
         };
 
-        const original_size = self.buffer_size;
         self.buffer_size = buffer_size;
-        if (buffer_size == 0) {
+        if (self.buffer_size == 0) {
             self.buffer_size = self.mux.defaultBufferSize();
-        }
-        if (original_size != self.buffer_size) {
-            self.freeBufferPool();
         }
     }
 
@@ -387,7 +404,6 @@ pub const Player = struct {
         self.mux.removePlayer(self);
 
         self.buffer.clearAndFree();
-        self.freeBufferPool();
         self.mux.allocator.destroy(self);
     }
 
@@ -410,15 +426,13 @@ pub const Player = struct {
 
         if (!self.eof) {
             const buf = try self.getTempBuffer();
-            defer {
-                if (self.buffer_pool) |*p| {
-                    p.*.release(buf);
-                }
-            }
+            defer self.mux.releaseBuffer(buf);
+
+            const chunk = buf.buf[0..self.buffer_size];
 
             while (self.buffer.items.len < self.buffer_size) {
-                const bytes_read = try self.read(buf.buf);
-                try self.buffer.appendSlice(buf.buf[0..bytes_read]);
+                const bytes_read = try self.read(chunk);
+                try self.buffer.appendSlice(chunk[0..bytes_read]);
                 if (bytes_read == 0) {
                     self.eof = true;
                     break;
@@ -450,7 +464,6 @@ pub const Player = struct {
         }
         self.state = .closed;
         self.buffer.clearAndFree();
-        self.freeBufferPool();
     }
 
     fn addToPlayers(self: *Player) !void {
@@ -578,13 +591,10 @@ pub const Player = struct {
         }
 
         const buf = try self.getTempBuffer();
-        defer {
-            if (self.buffer_pool) |*p| {
-                p.*.release(buf);
-            }
-        }
-        const n = try self.read(buf.buf);
-        try self.buffer.appendSlice(buf.buf[0..n]);
+        defer self.mux.releaseBuffer(buf);
+        const chunk = buf.buf[0..self.buffer_size];
+        const n = try self.read(chunk);
+        try self.buffer.appendSlice(chunk[0..n]);
         if (n == 0) {
             self.eof = true;
             if (self.buffer.items.len == 0) {
@@ -595,20 +605,6 @@ pub const Player = struct {
     }
 
     fn getTempBuffer(self: *Player) !*Buffer {
-        if (self.buffer_pool == null) {
-            // Create a pool with a reasonable number of buffers (e.g., 10)
-            // and use the actual buffer_size for the buffer size
-            self.buffer_pool = try Pool.init(self.mux.allocator, 1, self.buffer_size);
-        }
-
-        const buffer = try self.buffer_pool.?.acquire();
-        return buffer;
-    }
-
-    fn freeBufferPool(self: *Player) void {
-        if (self.buffer_pool) |*p| {
-            p.deinit();
-            self.buffer_pool = null;
-        }
+        return try self.mux.acquireBuffer(self.buffer_size);
     }
 };

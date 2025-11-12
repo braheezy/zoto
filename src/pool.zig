@@ -61,7 +61,8 @@ pub const Pool = struct {
     }
 
     pub fn release(self: *Pool, sb: *Buffer) void {
-        sb.reset();
+        // Keep the allocated capacity so future borrowers can reuse it.
+        sb.resetRetainingCapacity();
         if (!builtin.single_threaded) self.mutex.lock();
 
         var buffers = self.buffers;
