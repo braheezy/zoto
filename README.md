@@ -1,13 +1,13 @@
-## zoto
+# `zoto`
 
-Low-level Zig library to play audio on different platforms. Inspired by [`oto`
-](https://github.com/ebitengine/oto).
-
+Low-level Zig library to play audio on different platforms. Inspired by [`oto`](https://github.com/ebitengine/oto).
 
 Supports these platforms:
+
 - macOS
 - Linux/BSDs
 - Windows
+- WASM
 
 ## Prerequisites
 
@@ -134,4 +134,7 @@ try player.close();
 ```
 
 ### Detailed Example
+
 See the [player example in `zigaudio`](https://github.com/braheezy/zigaudio/blob/f86cb9b9cf0cc938965334a2eb73585e3064e96d/examples/player/main.zig).
+
+See the local [`wasm_player`](./examples/wasm_player/).
