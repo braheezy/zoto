@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const Format = @import("mux.zig").Format;
 
 var context_created: bool = false;
-var context_creation_mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = if (builtin.single_threaded) .{} else .{};
+var context_creation_mutex: if (builtin.single_threaded) struct {} else std.Io.Mutex = if (builtin.single_threaded) .{} else .init;
 
 pub const Options = struct {
     sample_rate: u32,
@@ -22,8 +22,8 @@ pub const Context = switch (builtin.os.tag) {
 
 pub fn newContext(allocator: std.mem.Allocator, options: Options) !*Context {
     if (!builtin.single_threaded) {
-        context_creation_mutex.lock();
-        defer context_creation_mutex.unlock();
+        context_creation_mutex.lockUncancelable(std.Options.debug_io);
+        defer context_creation_mutex.unlock(std.Options.debug_io);
     }
 
     if (context_created) {

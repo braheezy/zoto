@@ -5,8 +5,20 @@ const Buffer = @import("buffer.zig").Buffer;
 
 const Allocator = std.mem.Allocator;
 
+const CompatMutex = if (builtin.single_threaded) struct {} else struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *@This()) void {
+        self.inner.lockUncancelable(std.Options.debug_io);
+    }
+
+    fn unlock(self: *@This()) void {
+        self.inner.unlock(std.Options.debug_io);
+    }
+};
+
 pub const Pool = struct {
-    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = .{},
+    mutex: CompatMutex = .{},
     available: usize,
     allocator: Allocator,
     buffer_size: usize,

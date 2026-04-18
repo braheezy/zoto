@@ -6,6 +6,30 @@ const Reader = std.Io.Reader;
 
 const buffer_pool_initial_size: u16 = 4;
 
+const CompatMutex = if (builtin.single_threaded) struct {} else struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *@This()) void {
+        self.inner.lockUncancelable(std.Options.debug_io);
+    }
+
+    fn unlock(self: *@This()) void {
+        self.inner.unlock(std.Options.debug_io);
+    }
+};
+
+const CompatCondition = if (builtin.single_threaded) struct {} else struct {
+    inner: std.Io.Condition = .init,
+
+    fn wait(self: *@This(), mutex: *CompatMutex) void {
+        self.inner.waitUncancelable(std.Options.debug_io, &mutex.inner);
+    }
+
+    fn signal(self: *@This()) void {
+        self.inner.signal(std.Options.debug_io);
+    }
+};
+
 pub const Format = enum {
     float32_le,
     uint8,
@@ -27,8 +51,8 @@ pub const Mux = struct {
     players: std.array_list.Managed(*Player),
     buffer_pool: Pool,
     allocator: std.mem.Allocator,
-    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = .{},
-    condition: if (builtin.single_threaded) struct {} else std.Thread.Condition = .{},
+    mutex: CompatMutex = .{},
+    condition: CompatCondition = .{},
     shutdown: bool = false,
     thread: if (builtin.single_threaded) ?void else ?std.Thread = null,
     ready: bool = false,
@@ -276,7 +300,7 @@ fn muxLoop(self: *Mux) !void {
         // Sleeping is necessary especially on browsers.
         // Sometimes a player continues to read 0 bytes from the source and this loop can be a busy loop in such case.
         if (all_zero) {
-            std.Thread.sleep(std.time.ns_per_ms);
+            std.Io.sleep(std.Options.debug_io, .fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
         }
     }
 }
@@ -296,7 +320,7 @@ pub const Player = struct {
     buffer: std.array_list.Managed(u8),
     eof: bool = false,
     buffer_size: usize,
-    mutex: if (builtin.single_threaded) struct {} else std.Thread.Mutex = if (builtin.single_threaded) .{} else .{},
+    mutex: CompatMutex = .{},
 
     pub fn play(self: *Player) !void {
         if (builtin.single_threaded) {

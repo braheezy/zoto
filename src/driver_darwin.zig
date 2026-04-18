@@ -146,8 +146,8 @@ pub const Context = struct {
     allocated_buffers: ?[]AudioQueueBufferRef = null,
     buf32: ?[]f32 = null,
     one_buffer_size_in_bytes: u32,
-    mutex: std.Thread.Mutex,
-    condition: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    condition: std.Io.Condition,
     to_pause: bool,
     to_resume: bool,
     mux: *Mux,
@@ -176,8 +176,8 @@ pub const Context = struct {
         c.* = Context{
             .audio_queue = undefined,
             .unqueued_buffers = std.array_list.Managed(AudioQueueBufferRef).init(allocator),
-            .mutex = .{},
-            .condition = .{},
+            .mutex = .init,
+            .condition = .init,
             .to_pause = false,
             .to_resume = false,
             .one_buffer_size_in_bytes = one_buffer_size_in_bytes,
@@ -205,7 +205,7 @@ pub const Context = struct {
         _ = AudioQueueStop(self.audio_queue, true);
 
         // Give any in-flight callbacks time to complete
-        std.Thread.sleep(std.time.ns_per_ms * 50);
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(std.time.ns_per_ms * 50), .awake) catch {};
 
         // Dispose of the audio queue and wait for cleanup
         _ = AudioQueueDispose(self.audio_queue, false);
@@ -223,39 +223,39 @@ pub const Context = struct {
     }
 
     pub fn waitForReady(self: *Context) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         while (!self.ready) {
-            self.condition.wait(&self.mutex);
+            self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
         }
     }
 
     pub fn pause(self: *Context) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.err) |err| return err;
 
         self.to_pause = true;
         self.to_resume = false;
-        self.condition.signal();
+        self.condition.signal(std.Options.debug_io);
     }
 
     pub fn play(self: *Context) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.err) |err| return err;
 
         self.to_pause = false;
         self.to_resume = true;
-        self.condition.signal();
+        self.condition.signal(std.Options.debug_io);
     }
 
     pub fn getErr(self: *Context) ?anyerror {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         return self.err;
     }
 
@@ -264,11 +264,11 @@ pub const Context = struct {
     }
 
     fn wait(self: *Context) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         while (self.unqueued_buffers.items.len == 0 and self.err == null and !self.to_pause and !self.to_resume) {
-            self.condition.wait(&self.mutex);
+            self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
         }
         return self.err == null;
     }
@@ -277,9 +277,9 @@ pub const Context = struct {
         // Allocate the buffer once and store it in the context
         if (self.buf32 == null) {
             self.buf32 = self.allocator.alloc(f32, self.one_buffer_size_in_bytes / 4) catch |loop_err| {
-                self.mutex.lock();
+                self.mutex.lockUncancelable(std.Options.debug_io);
                 if (self.err == null) self.err = loop_err;
-                self.mutex.unlock();
+                self.mutex.unlock(std.Options.debug_io);
                 return;
             };
         }
@@ -295,8 +295,8 @@ pub const Context = struct {
     }
 
     fn appendBuffer(self: *Context, buf32: []f32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.err != null) {
             return;
@@ -364,14 +364,14 @@ pub const Context = struct {
                 retry_count < 30)
             {
                 // Use exponential backoff for temporary errors
-                std.Thread.sleep(sleepTime(retry_count));
+                std.Io.sleep(std.Options.debug_io, .fromNanoseconds(sleepTime(retry_count)), .awake) catch {};
                 retry_count += 1;
                 continue;
             }
 
             if (osstatus == av_audio_session_error_code_siri_is_recording) {
                 // Siri recording error should be temporary
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std.Io.sleep(std.Options.debug_io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
                 continue;
             }
 
@@ -380,21 +380,21 @@ pub const Context = struct {
     }
 
     fn suspendPlay(self: *Context) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         self.to_pause = true;
         self.to_resume = false;
-        self.condition.signal();
+        self.condition.signal(std.Options.debug_io);
     }
 
     fn resumePlay(self: *Context) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         self.to_pause = false;
         self.to_resume = true;
-        self.condition.signal();
+        self.condition.signal(std.Options.debug_io);
     }
 };
 
@@ -403,11 +403,11 @@ var context: *Context = undefined;
 fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void {
     var ready_closed = false;
     defer {
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
+        ctx.mutex.lockUncancelable(std.Options.debug_io);
+        defer ctx.mutex.unlock(std.Options.debug_io);
         if (!ready_closed) {
             ctx.ready = true;
-            ctx.condition.signal();
+            ctx.condition.signal(std.Options.debug_io);
         }
     }
 
@@ -439,7 +439,7 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
         }
 
         if (osstatus == av_audio_session_error_code_cannot_start_playing and retry_count < 100) {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            std.Io.sleep(std.Options.debug_io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
             retry_count += 1;
             continue;
         }
@@ -448,10 +448,10 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
         return;
     }
 
-    ctx.mutex.lock();
+    ctx.mutex.lockUncancelable(std.Options.debug_io);
     ctx.ready = true;
-    ctx.condition.signal();
-    ctx.mutex.unlock();
+    ctx.condition.signal(std.Options.debug_io);
+    ctx.mutex.unlock(std.Options.debug_io);
     ready_closed = true;
 
     // Start the main audio processing loop
@@ -462,8 +462,8 @@ fn render(user_data: ?*anyopaque, aq: AudioQueueRef, buffer: AudioQueueBufferRef
     _ = user_data;
     _ = aq;
 
-    context.mutex.lock();
-    defer context.mutex.unlock();
+    context.mutex.lockUncancelable(std.Options.debug_io);
+    defer context.mutex.unlock(std.Options.debug_io);
 
     // Add the finished buffer back to the pool of available buffers
     context.unqueued_buffers.append(buffer) catch |err| {
@@ -472,7 +472,7 @@ fn render(user_data: ?*anyopaque, aq: AudioQueueRef, buffer: AudioQueueBufferRef
     };
 
     // Signal that a buffer is available
-    context.condition.signal();
+    context.condition.signal(std.Options.debug_io);
 }
 
 fn sleepTime(count: i32) u64 {
