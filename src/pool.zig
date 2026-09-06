@@ -117,3 +117,44 @@ pub const Pool = struct {
         if (!builtin.single_threaded) self.mutex.unlock();
     }
 };
+
+fn poolAllocationScenario(allocator: std.mem.Allocator) !void {
+    var pool = try Pool.init(allocator, 3, 8);
+    defer pool.deinit();
+    const first = try pool.acquire();
+    defer pool.release(first);
+    const second = try pool.acquire();
+    defer pool.release(second);
+    const third = try pool.acquire();
+    defer pool.release(third);
+    const overflow = try pool.acquire();
+    defer pool.release(overflow);
+}
+
+test "pool construction and overflow allocation clean up every failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, poolAllocationScenario, .{});
+}
+
+test "pool keeps its capacity but releases custom allocator storage" {
+    var pool = try Pool.init(std.testing.allocator, 1, 4);
+    defer pool.deinit();
+    const first = try pool.acquire();
+    try first.ensureTotalCapacity(64);
+    const retained = first.buf.ptr;
+    pool.release(first);
+    const second = try pool.acquire();
+    try std.testing.expectEqual(retained, second.buf.ptr);
+    pool.release(second);
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const custom = try pool.acquireWithAllocator(arena.allocator());
+        try std.testing.expect(custom.dynamic == null);
+        try custom.ensureTotalCapacity(128);
+        pool.release(custom);
+        try std.testing.expect(custom.dynamic == null);
+    }
+    const last = try pool.acquire();
+    defer pool.release(last);
+    try last.ensureTotalCapacity(256);
+}
