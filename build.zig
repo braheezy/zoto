@@ -21,4 +21,16 @@ pub fn build(b: *std.Build) void {
     } else if (target_os == .linux) {
         root_mod.linkSystemLibrary("asound", .{});
     }
+    // Mixer and pool tests need no audio device or platform driver.
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mux.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run mixer and buffer pool regression tests");
+    test_step.dependOn(&run_tests.step);
 }
