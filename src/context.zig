@@ -21,15 +21,14 @@ pub const Context = switch (builtin.os.tag) {
 };
 
 pub fn newContext(allocator: std.mem.Allocator, options: Options) !*Context {
-    if (!builtin.single_threaded) {
+    if (!builtin.single_threaded)
         context_creation_mutex.lockUncancelable(std.Options.debug_io);
-        defer context_creation_mutex.unlock(std.Options.debug_io);
-    }
+    defer if (!builtin.single_threaded)
+        context_creation_mutex.unlock(std.Options.debug_io);
 
     if (context_created) {
         return error.ContextAlreadyCreated;
     }
-    context_created = true;
 
     var buffer_size_in_bytes: u32 = 0;
     if (options.buffer_size != 0) {
@@ -48,5 +47,6 @@ pub fn newContext(allocator: std.mem.Allocator, options: Options) !*Context {
         buffer_size_in_bytes,
     );
 
+    context_created = true;
     return ctx;
 }

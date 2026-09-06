@@ -26,11 +26,20 @@ pub const Pool = struct {
 
     pub fn init(allocator: Allocator, pool_size: u16, buffer_size: usize) !Pool {
         const buffers = try allocator.alloc(*Buffer, pool_size);
+        errdefer allocator.free(buffers);
+
+        var initialized: usize = 0;
+        errdefer for (buffers[0..initialized]) |sb| {
+            sb.deinit();
+            allocator.destroy(sb);
+        };
 
         for (0..pool_size) |i| {
             const sb = try allocator.create(Buffer);
+            errdefer allocator.destroy(sb);
             sb.* = try Buffer.init(allocator, buffer_size);
             buffers[i] = sb;
+            initialized += 1;
         }
 
         return .{ .mutex = .{}, .buffers = buffers, .allocator = allocator, .available = pool_size, .buffer_size = buffer_size };
@@ -60,6 +69,7 @@ pub const Pool = struct {
 
             const allocator = self.allocator;
             const sb = try allocator.create(Buffer);
+            errdefer allocator.destroy(sb);
             sb.* = try Buffer.init(allocator, self.buffer_size);
             sb._da = dyn_allocator;
             return sb;
@@ -68,13 +78,29 @@ pub const Pool = struct {
         const sb = buffers[index];
         self.available = index;
         if (!builtin.single_threaded) self.mutex.unlock();
+        // Existing dynamic storage must be freed by its original allocator.
+        const previous_allocator = sb._da orelse sb._a;
+        if (previous_allocator.ptr != dyn_allocator.ptr or
+            previous_allocator.vtable != dyn_allocator.vtable)
+        {
+            sb.reset();
+        }
         sb._da = dyn_allocator;
         return sb;
     }
 
     pub fn release(self: *Pool, sb: *Buffer) void {
-        // Keep the allocated capacity so future borrowers can reuse it.
-        sb.resetRetainingCapacity();
+        // Retain capacity owned by the pool allocator. A borrower's allocator
+        // may expire after release, so free its dynamic storage now.
+        const dynamic_allocator = sb._da orelse sb._a;
+        if (dynamic_allocator.ptr == self.allocator.ptr and
+            dynamic_allocator.vtable == self.allocator.vtable)
+        {
+            sb.resetRetainingCapacity();
+        } else {
+            sb.reset();
+        }
+
         if (!builtin.single_threaded) self.mutex.lock();
 
         var buffers = self.buffers;
