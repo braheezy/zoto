@@ -4,9 +4,7 @@ const Mux = mux.Mux;
 const Player = mux.Player;
 const Format = mux.Format;
 
-const c = @cImport({
-    @cInclude("alsa/asoundlib.h");
-});
+const c = @import("alsa");
 
 const float32_size_in_bytes: usize = @sizeOf(f32);
 const period_count: usize = 2;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -19,7 +20,13 @@ pub fn build(b: *std.Build) void {
         }).module("objc"));
         root_mod.linkFramework("AudioToolbox", .{});
     } else if (target_os == .linux) {
-        root_mod.linkSystemLibrary("asound", .{});
+        const translator: Translator = .init(b.dependency("translate_c", .{}), .{
+            .c_source_file = b.path("src/alsa.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_system_libs = &.{.{ .name = "asound" }},
+        });
+        root_mod.addImport("alsa", translator.mod);
     }
     // Mixer and pool tests need no audio device or platform driver.
     const unit_tests = b.addTest(.{
