@@ -73,6 +73,12 @@ pub const Mux = struct {
             self.allocator.destroy(self);
             return err;
         };
+        errdefer {
+            self.buffer_pool.deinit();
+            self.players.deinit();
+            self.allocator.destroy(self);
+        }
+
         // For single-threaded WASM, don't spawn a thread - process synchronously in readFloat32s
         if (builtin.single_threaded) {
             self.thread = null;
@@ -117,13 +123,14 @@ pub const Mux = struct {
     }
 
     pub fn addPlayer(self: *Mux, player: *Player) !void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-        }
-        defer if (!builtin.single_threaded) {
-            self.mutex.unlock();
-        };
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
 
+        try self.addPlayerLocked(player);
+    }
+
+    /// Caller holds the mixer mutex in multithreaded builds.
+    fn addPlayerLocked(self: *Mux, player: *Player) !void {
         // Check if player is already in the list to prevent duplicates
         for (self.players.items) |p| {
             if (p == player) {
@@ -139,37 +146,39 @@ pub const Mux = struct {
     }
 
     pub fn readFloat32s(self: *Mux, dst: []f32) !void {
-        // For single-threaded WASM, process mux loop work synchronously here
-        // (like oto's driver_js.go which calls mux.ReadFloat32s directly from JS callbacks)
+        var players = std.array_list.Managed(*Player).init(self.allocator);
+        defer players.deinit();
+        {
+            if (!builtin.single_threaded) self.mutex.lock();
+            defer if (!builtin.single_threaded) self.mutex.unlock();
+            try self.retainPlayersLocked(&players);
+        }
+        defer self.releasePlayers(&players);
+
+        // Without a worker thread, fill source buffers synchronously before mixing.
         if (builtin.single_threaded) {
-            // Process players: read from sources to buffers
-            for (self.players.items) |player| {
+            for (players.items) |player| {
                 _ = try player.readSourceToBuffer();
             }
         }
 
-        const players = try self.players.clone();
-        defer players.deinit();
-
         @memset(dst, 0);
-
         for (players.items) |player| {
             _ = player.readBufferAndAdd(dst);
         }
 
-        if (!builtin.single_threaded) {
-            self.condition.signal();
-        }
+        if (!builtin.single_threaded) self.condition.signal();
     }
 
     pub fn removePlayer(self: *Mux, player: *Player) void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-        }
-        defer if (!builtin.single_threaded) {
-            self.mutex.unlock();
-        };
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
 
+        self.removePlayerLocked(player);
+    }
+
+    /// Caller holds the mixer mutex in multithreaded builds.
+    fn removePlayerLocked(self: *Mux, player: *Player) void {
         for (self.players.items, 0..) |p, i| {
             if (p == player) {
                 _ = self.players.orderedRemove(i);
@@ -195,10 +204,8 @@ pub const Mux = struct {
     }
 
     pub fn setReady(self: *Mux, ready: bool) void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
 
         self.ready = ready;
 
@@ -208,18 +215,16 @@ pub const Mux = struct {
     }
 
     pub fn getErr(self: *Mux) ?anyerror {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
+
         return self.err;
     }
 
     pub fn setErr(self: *Mux, err: ?anyerror) void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-        }
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
+
         self.err = err;
     }
 
@@ -259,6 +264,7 @@ pub const Mux = struct {
 
     fn acquireBuffer(self: *Mux, size: usize) !*Buffer {
         const buf = try self.buffer_pool.acquire();
+        errdefer self.buffer_pool.release(buf);
         if (buf.buf.len < size) {
             try buf.ensureTotalCapacity(size);
         }
@@ -267,6 +273,34 @@ pub const Mux = struct {
 
     fn releaseBuffer(self: *Mux, buffer: *Buffer) void {
         self.buffer_pool.release(buffer);
+    }
+
+    /// Caller holds the mixer mutex. An empty snapshot is required.
+    fn retainPlayersLocked(
+        self: *Mux,
+        players: *std.array_list.Managed(*Player),
+    ) !void {
+        std.debug.assert(players.items.len == 0);
+        // Allocate before retaining so failure leaves no outstanding borrows.
+        try players.appendSlice(self.players.items);
+        for (players.items) |player| player.snapshot_refs += 1;
+    }
+
+    fn releasePlayers(
+        self: *Mux,
+        players: *std.array_list.Managed(*Player),
+    ) void {
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
+
+        for (players.items) |player| {
+            std.debug.assert(player.snapshot_refs > 0);
+            player.snapshot_refs -= 1;
+            if (!builtin.single_threaded and player.snapshot_refs == 0) {
+                player.snapshots_drained.signal();
+            }
+        }
+        players.clearRetainingCapacity();
     }
 };
 
@@ -278,16 +312,14 @@ fn muxLoop(self: *Mux) !void {
         self.wait();
 
         // Check if shutdown was requested
-        self.mutex.lock();
-        const should_shutdown = self.shutdown;
-        if (should_shutdown) {
-            self.mutex.unlock();
-            break;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.shutdown) break;
+            try self.retainPlayersLocked(&players);
         }
-
-        players.clearRetainingCapacity();
-        try players.appendSlice(self.players.items);
-        self.mutex.unlock();
+        // Runs on every iteration, including a source-read error.
+        defer self.releasePlayers(&players);
 
         var all_zero = true;
         for (players.items) |player| {
@@ -321,15 +353,31 @@ pub const Player = struct {
     eof: bool = false,
     buffer_size: usize,
     mutex: CompatMutex = .{},
+    // Protected by mux.mutex, including the condition wait.
+    snapshot_refs: usize = 0,
+    snapshots_drained: CompatCondition = .{},
 
     pub fn play(self: *Player) !void {
-        if (builtin.single_threaded) {
-            // Single-threaded: call directly (like oto's WASM driver)
-            try self.playImpl();
-        } else {
-            const thread = try std.Thread.spawn(.{}, Player.playThread, .{self});
-            thread.join();
+        // Eensure the first player lock is released before acquiring the mixer lock
+        {
+            if (!builtin.single_threaded) self.mutex.lock();
+            defer if (!builtin.single_threaded) self.mutex.unlock();
+
+            if (self.state != .paused) return;
+            try self.prepareBuffer();
         }
+        if (!builtin.single_threaded) self.mux.mutex.lock();
+        defer if (!builtin.single_threaded) self.mux.mutex.unlock();
+
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
+
+        // Another control call may have changed state during preparation.
+        if (self.state != .paused) return;
+
+        try self.mux.addPlayerLocked(self);
+        self.state =
+            if (self.eof and self.buffer.items.len == 0) .paused else .play;
     }
 
     pub fn pause(self: *Player) void {
@@ -414,40 +462,39 @@ pub const Player = struct {
     }
 
     pub fn close(self: *Player) !void {
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-        }
-        defer if (!builtin.single_threaded) {
-            self.mutex.unlock();
-        };
+        if (!builtin.single_threaded) self.mux.mutex.lock();
+        defer if (!builtin.single_threaded) self.mux.mutex.unlock();
+
+        if (!builtin.single_threaded) self.mutex.lock();
+        defer if (!builtin.single_threaded) self.mutex.unlock();
+
         try self.closeImpl();
     }
 
+    /// The caller must stop all other public calls on this player first.
+    /// Keep the source reader and mixer alive until this returns. Do not call
+    /// from a source read callback; this waits for outstanding mixer uses.
     pub fn deinit(self: *Player) void {
-        // Remove from mux player list first
-        self.mux.removePlayer(self);
+        {
+            if (!builtin.single_threaded) self.mux.mutex.lock();
+            defer if (!builtin.single_threaded) self.mux.mutex.unlock();
+
+            self.mux.removePlayerLocked(self);
+            if (!builtin.single_threaded) {
+                while (self.snapshot_refs != 0) {
+                    self.snapshots_drained.wait(&self.mux.mutex);
+                }
+            } else {
+                std.debug.assert(self.snapshot_refs == 0);
+            }
+        }
 
         self.buffer.clearAndFree();
         self.mux.allocator.destroy(self);
     }
 
-    fn playThread(ctx: *anyopaque) !void {
-        var self: *Player = @ptrCast(@alignCast(ctx));
-        if (!builtin.single_threaded) {
-            self.mutex.lock();
-        }
-        defer if (!builtin.single_threaded) {
-            self.mutex.unlock();
-        };
-        try self.playImpl();
-    }
-
-    fn playImpl(self: *Player) !void {
-        if (self.state != .paused) {
-            return;
-        }
-        self.state = .play;
-
+    /// Caller holds the player mutex; this function never takes the mixer mutex.
+    fn prepareBuffer(self: *Player) !void {
         if (!self.eof) {
             const buf = try self.getTempBuffer();
             defer self.mux.releaseBuffer(buf);
@@ -463,12 +510,6 @@ pub const Player = struct {
                 }
             }
         }
-
-        if (self.eof and self.buffer.items.len == 0) {
-            self.state = .paused;
-        }
-
-        try self.addToPlayers();
     }
 
     fn resetImpl(self: *Player) void {
@@ -481,23 +522,13 @@ pub const Player = struct {
     }
 
     fn closeImpl(self: *Player) !void {
-        self.removeFromPlayers();
+        self.mux.removePlayerLocked(self);
 
         if (self.state == .closed) {
             return error.PlayerAlreadyClosed;
         }
         self.state = .closed;
         self.buffer.clearAndFree();
-    }
-
-    fn addToPlayers(self: *Player) !void {
-        // Note: This function assumes the caller already holds the mutex
-        try self.mux.addPlayer(self);
-    }
-
-    fn removeFromPlayers(self: *Player) void {
-        // Note: This function assumes the caller already holds the mutex
-        self.mux.removePlayer(self);
     }
 
     fn read(self: *Player, buf: []u8) !usize {
@@ -632,3 +663,230 @@ pub const Player = struct {
         return try self.mux.acquireBuffer(self.buffer_size);
     }
 };
+
+// Regression fixtures use a mixer without a worker so each interleaving is explicit.
+fn dormantMux() !Mux {
+    return .{
+        .sample_rate = 2,
+        .channel_count = 1,
+        .format = .float32_le,
+        .players = std.array_list.Managed(*Player).init(std.testing.allocator),
+        .buffer_pool = try Pool.init(std.testing.allocator, 1, 4),
+        .allocator = std.testing.allocator,
+    };
+}
+
+const pcm = [_]u8{ 0, 0, 128, 62 }; // One little-endian f32 sample: 0.25.
+
+test "play registration failure preserves buffered audio for retry" {
+    var mux = try dormantMux();
+    defer mux.players.deinit();
+    defer mux.buffer_pool.deinit();
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    mux.players = std.array_list.Managed(*Player).init(fail.allocator());
+    var source = Reader.fixed(&pcm);
+    const player = try mux.newPlayer(&source);
+    defer player.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, player.play());
+    try std.testing.expect(!player.isPlaying());
+    try std.testing.expectEqual(@as(usize, 4), player.bufferedSize());
+    try std.testing.expectEqual(@as(usize, 4), source.seek);
+    try std.testing.expectEqual(@as(usize, 0), mux.players.items.len);
+
+    fail.fail_index = std.math.maxInt(usize);
+    try player.play();
+    try std.testing.expect(player.isPlaying());
+    try std.testing.expectEqual(@as(usize, 1), mux.players.items.len);
+    var mixed: [1]f32 = undefined;
+    try mux.readFloat32s(&mixed);
+    try std.testing.expectEqual(@as(f32, 0.25), mixed[0]);
+}
+
+const Gate = struct {
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    signaled: bool = false,
+
+    fn signal(self: *Gate) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        self.signaled = true;
+        self.condition.broadcast(std.Options.debug_io);
+    }
+
+    fn wait(self: *Gate) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        while (!self.signaled) self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
+    }
+};
+
+const BlockingReader = struct {
+    reader: Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+    backing: Reader = Reader.fixed(&pcm),
+    entered: Gate = .{},
+    allow_read: Gate = .{},
+    waited: bool = false,
+
+    fn stream(reader: *Reader, writer: *std.Io.Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const self: *BlockingReader = @fieldParentPtr("reader", reader);
+        if (!self.waited) {
+            self.waited = true;
+            self.entered.signal();
+            self.allow_read.wait();
+        }
+        return self.backing.stream(writer, limit);
+    }
+};
+
+const PlayTask = struct {
+    player: *Player,
+    failure: ?anyerror = null,
+    fn run(self: *PlayTask) void {
+        self.player.play() catch |err| {
+            self.failure = err;
+        };
+    }
+};
+
+test "play releases the player lock before waiting for the mixer lock" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var mux = try dormantMux();
+    defer mux.players.deinit();
+    defer mux.buffer_pool.deinit();
+    var source: BlockingReader = .{};
+    const player = try mux.newPlayer(&source.reader);
+    defer player.deinit();
+    try mux.addPlayer(player);
+
+    var task: PlayTask = .{ .player = player };
+    {
+        const thread = try std.Thread.spawn(.{}, PlayTask.run, .{&task});
+        defer thread.join();
+        source.entered.wait();
+
+        {
+            mux.mutex.lock();
+            defer mux.mutex.unlock();
+            source.allow_read.signal();
+            _ = mux.shouldWait();
+            try std.testing.expect(!player.isPlaying());
+        }
+    }
+    try std.testing.expect(task.failure == null);
+    try std.testing.expect(player.isPlaying());
+}
+
+test "close removes the player and subsequent play cannot restart it" {
+    var mux = try dormantMux();
+    defer mux.players.deinit();
+    defer mux.buffer_pool.deinit();
+    var source = Reader.fixed(&pcm);
+    const player = try mux.newPlayer(&source);
+    defer player.deinit();
+    try player.play();
+    try player.close();
+    try std.testing.expect(!player.isPlaying());
+    try std.testing.expectEqual(@as(usize, 0), player.bufferedSize());
+    try std.testing.expectEqual(@as(usize, 0), mux.players.items.len);
+    try player.play();
+    try std.testing.expectEqual(@as(usize, 0), mux.players.items.len);
+    try std.testing.expectError(error.PlayerAlreadyClosed, player.close());
+}
+
+const DestroyTask = struct {
+    fn run(player: *Player) void {
+        player.deinit();
+    }
+};
+
+test "deinit waits for both retained snapshots after removing the player" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var mux = try dormantMux();
+    defer mux.players.deinit();
+    defer mux.buffer_pool.deinit();
+    var source = Reader.fixed(&pcm);
+    const player = try mux.newPlayer(&source);
+    try player.play();
+    var first = std.array_list.Managed(*Player).init(std.testing.allocator);
+    defer first.deinit();
+    var second = std.array_list.Managed(*Player).init(std.testing.allocator);
+    defer second.deinit();
+    {
+        mux.mutex.lock();
+        defer mux.mutex.unlock();
+        try mux.retainPlayersLocked(&first);
+        try mux.retainPlayersLocked(&second);
+    }
+    const thread = try std.Thread.spawn(.{}, DestroyTask.run, .{player});
+    defer thread.join();
+    defer mux.releasePlayers(&first);
+    defer mux.releasePlayers(&second);
+    {
+        mux.mutex.lock();
+        defer mux.mutex.unlock();
+        while (mux.players.items.len != 0) mux.condition.wait(&mux.mutex);
+        try std.testing.expectEqual(@as(usize, 2), player.snapshot_refs);
+    }
+    mux.releasePlayers(&first);
+    {
+        mux.mutex.lock();
+        defer mux.mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 1), player.snapshot_refs);
+    }
+    // The last outstanding snapshot can still safely use the player.
+    var mixed: [1]f32 = undefined;
+    @memset(&mixed, 0);
+    _ = second.items[0].readBufferAndAdd(&mixed);
+    try std.testing.expectEqual(@as(f32, 0.25), mixed[0]);
+    mux.releasePlayers(&second);
+}
+
+test "snapshot allocation failure releases the mixer lock and retains nothing" {
+    var mux = try dormantMux();
+    defer mux.players.deinit();
+    defer mux.buffer_pool.deinit();
+    var source = Reader.fixed(&pcm);
+    const player = try mux.newPlayer(&source);
+    defer player.deinit();
+    try player.play();
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = mux.allocator;
+    mux.allocator = fail.allocator();
+    var mixed: [1]f32 = undefined;
+    const result = mux.readFloat32s(&mixed);
+    mux.allocator = allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqual(@as(usize, 0), player.snapshot_refs);
+    try player.close();
+}
+
+test "failed mixer buffer growth returns the borrowed buffer" {
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var mux = try dormantMux();
+    mux.buffer_pool.deinit();
+    mux.buffer_pool = try Pool.init(fail.allocator(), 1, 4);
+    defer mux.buffer_pool.deinit();
+    defer mux.players.deinit();
+    fail.fail_index = fail.alloc_index;
+    fail.resize_fail_index = fail.resize_index;
+    try std.testing.expectError(error.OutOfMemory, mux.acquireBuffer(128));
+    try std.testing.expectEqual(@as(usize, 1), mux.buffer_pool.available);
+}
+
+test "worker allocation error releases retained players" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var mux = try dormantMux();
+    defer mux.players.deinit();
+    defer mux.buffer_pool.deinit();
+    var source = Reader.fixed(&pcm);
+    const player = try mux.newPlayer(&source);
+    defer player.deinit();
+    var fail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    player.buffer = std.array_list.Managed(u8).init(fail.allocator());
+    try mux.addPlayer(player);
+    try std.testing.expectError(error.OutOfMemory, muxLoop(&mux));
+    try std.testing.expectEqual(@as(usize, 0), player.snapshot_refs);
+    try player.close();
+}

@@ -97,7 +97,14 @@ extern "c" fn AudioQueueDispose(
     immediate: bool,
 ) i32;
 
-fn newAudioQueue(allocator: std.mem.Allocator, sample_rate: u32, channel_count: u32, one_buffer_size_in_bytes: u32) !struct { AudioQueueRef, []AudioQueueBufferRef } {
+fn disposeAudioQueue(queue: AudioQueueRef) void {
+    const status = AudioQueueDispose(queue, true);
+    if (status != no_err) {
+        std.debug.panic("AudioQueueDispose failed: {d}", .{status});
+    }
+}
+
+fn newAudioQueue(ctx: *Context, allocator: std.mem.Allocator, sample_rate: u32, channel_count: u32, one_buffer_size_in_bytes: u32) !struct { AudioQueueRef, []AudioQueueBufferRef } {
     const description = AudioStreamBasicDescription{
         .sample_rate = @floatFromInt(sample_rate),
         .format_id = audio_format_linear_pcm,
@@ -113,7 +120,7 @@ fn newAudioQueue(allocator: std.mem.Allocator, sample_rate: u32, channel_count: 
     const err = AudioQueueNewOutput(
         &description,
         render,
-        null,
+        ctx,
         0,
         0,
         0,
@@ -123,8 +130,10 @@ fn newAudioQueue(allocator: std.mem.Allocator, sample_rate: u32, channel_count: 
         std.log.err("AudioQueueNewOutput failed with error: {}\n", .{err});
         return error.AudioQueueNewOutputFailed;
     }
+    errdefer disposeAudioQueue(audio_queue);
 
     const bufs = try allocator.alloc(AudioQueueBufferRef, buffer_count);
+    errdefer allocator.free(bufs);
     var i: usize = 0;
     while (i < buffer_count) : (i += 1) {
         var buf: AudioQueueBufferRef = undefined;
@@ -141,7 +150,7 @@ fn newAudioQueue(allocator: std.mem.Allocator, sample_rate: u32, channel_count: 
 }
 
 pub const Context = struct {
-    audio_queue: AudioQueueRef,
+    audio_queue: ?AudioQueueRef = null,
     unqueued_buffers: std.array_list.Managed(AudioQueueBufferRef),
     allocated_buffers: ?[]AudioQueueBufferRef = null,
     buf32: ?[]f32 = null,
@@ -151,9 +160,12 @@ pub const Context = struct {
     to_pause: bool,
     to_resume: bool,
     mux: *Mux,
+    // initialization has finished, including failure handling
     ready: bool,
     allocator: std.mem.Allocator,
     err: ?anyerror = null,
+    worker: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator, sample_rate: u32, channel_count: u32, format: Format, buffer_size_in_bytes: u32) !*Context {
         // defaultOneBufferSizeInBytes is the default buffer size in bytes.
@@ -173,8 +185,9 @@ pub const Context = struct {
         one_buffer_size_in_bytes = one_buffer_size_in_bytes / bytes_per_sample * bytes_per_sample;
 
         const c = try allocator.create(Context);
+        errdefer allocator.destroy(c);
         c.* = Context{
-            .audio_queue = undefined,
+            .audio_queue = null,
             .unqueued_buffers = std.array_list.Managed(AudioQueueBufferRef).init(allocator),
             .mutex = .init,
             .condition = .init,
@@ -190,25 +203,36 @@ pub const Context = struct {
             .ready = false,
             .allocator = allocator,
         };
-
-        context = c;
+        errdefer c.mux.deinit();
+        errdefer c.unqueued_buffers.deinit();
 
         // Spawn the audio worker thread
-        const thread = try std.Thread.spawn(.{}, audioContextWorker, .{ c, sample_rate, channel_count });
-        thread.detach();
+        c.worker = try std.Thread.spawn(
+            .{},
+            audioContextWorker,
+            .{ c, sample_rate, channel_count },
+        );
 
         return c;
     }
 
     pub fn deinit(self: *Context) void {
+        self.stopping.store(true, .release);
+
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        self.condition.broadcast(std.Options.debug_io);
+        self.mutex.unlock(std.Options.debug_io);
+
+        if (self.worker) |worker| {
+            worker.join();
+            self.worker = null;
+        }
+
         // Stop the audio queue immediately to prevent new callbacks from being queued
-        _ = AudioQueueStop(self.audio_queue, true);
-
-        // Give any in-flight callbacks time to complete
-        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(std.time.ns_per_ms * 50), .awake) catch {};
-
-        // Dispose of the audio queue and wait for cleanup
-        _ = AudioQueueDispose(self.audio_queue, false);
+        if (self.audio_queue) |queue| {
+            disposeAudioQueue(queue);
+            self.audio_queue = null;
+        }
 
         // Now it's safe to clean up other resources
         self.mux.deinit();
@@ -267,23 +291,18 @@ pub const Context = struct {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
 
-        while (self.unqueued_buffers.items.len == 0 and self.err == null and !self.to_pause and !self.to_resume) {
+        while (!self.stopping.load(.acquire) and
+            self.unqueued_buffers.items.len == 0 and
+            self.err == null and
+            !self.to_pause and
+            !self.to_resume)
+        {
             self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
         }
-        return self.err == null;
+        return !self.stopping.load(.acquire) and self.err == null;
     }
 
     fn loop(self: *Context) void {
-        // Allocate the buffer once and store it in the context
-        if (self.buf32 == null) {
-            self.buf32 = self.allocator.alloc(f32, self.one_buffer_size_in_bytes / 4) catch |loop_err| {
-                self.mutex.lockUncancelable(std.Options.debug_io);
-                if (self.err == null) self.err = loop_err;
-                self.mutex.unlock(std.Options.debug_io);
-                return;
-            };
-        }
-
         const buf32 = self.buf32.?;
 
         while (true) {
@@ -297,6 +316,8 @@ pub const Context = struct {
     fn appendBuffer(self: *Context, buf32: []f32) void {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
+
+        if (self.stopping.load(.acquire)) return;
 
         if (self.err != null) {
             return;
@@ -338,14 +359,14 @@ pub const Context = struct {
 
         @memcpy(audio_data_slice, buf32[0..@min(buf32.len, audio_data_slice.len)]);
 
-        const osstatus = AudioQueueEnqueueBuffer(self.audio_queue, buf, 0, null);
+        const osstatus = AudioQueueEnqueueBuffer(self.audio_queue.?, buf, 0, null);
         if (osstatus != no_err) {
             if (self.err == null) self.err = error.AudioQueueEnqueueBufferFailed;
         }
     }
 
     fn pauseImpl(self: *Context) !void {
-        const osstatus = AudioQueuePause(self.audio_queue);
+        const osstatus = AudioQueuePause(self.audio_queue.?);
         if (osstatus != no_err) {
             return error.AudioQueuePauseFailed;
         }
@@ -354,7 +375,9 @@ pub const Context = struct {
     fn resumeImpl(self: *Context) !void {
         var retry_count: i32 = 0;
         while (true) {
-            const osstatus = AudioQueueStart(self.audio_queue, null);
+            if (self.stopping.load(.acquire)) return;
+
+            const osstatus = AudioQueueStart(self.audio_queue.?, null);
             if (osstatus == no_err) {
                 break;
             }
@@ -398,26 +421,28 @@ pub const Context = struct {
     }
 };
 
-var context: *Context = undefined;
-
 fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void {
     var ready_closed = false;
+    var initialization_error: anyerror = error.ContextDestroyed;
     defer {
         ctx.mutex.lockUncancelable(std.Options.debug_io);
         defer ctx.mutex.unlock(std.Options.debug_io);
+
         if (!ready_closed) {
+            if (ctx.err == null) ctx.err = initialization_error;
             ctx.ready = true;
-            ctx.condition.signal(std.Options.debug_io);
+            ctx.condition.broadcast(std.Options.debug_io);
         }
     }
 
-    // Call newAudioQueue equivalent
     const q, const bs = newAudioQueue(
+        ctx,
         ctx.allocator,
         sample_rate,
         channel_count,
         ctx.one_buffer_size_in_bytes,
     ) catch |err| {
+        initialization_error = err;
         // Store error in context
         std.log.err("newAudioQueue failed: {any}", .{err});
         return;
@@ -427,13 +452,25 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
     ctx.allocated_buffers = bs;
     ctx.unqueued_buffers.clearAndFree();
     ctx.unqueued_buffers.appendSlice(bs) catch |err| {
+        initialization_error = err;
         std.log.err("Failed to append buffers in audioContextWorker: {any}", .{err});
+        return;
+    };
+
+    // Allocate the buffer once and store it in the context
+    ctx.buf32 = ctx.allocator.alloc(
+        f32,
+        ctx.one_buffer_size_in_bytes / float32_size_in_bytes,
+    ) catch |err| {
+        initialization_error = err;
         return;
     };
 
     var retry_count: i32 = 0;
     while (true) {
-        const osstatus = AudioQueueStart(ctx.audio_queue, null);
+        if (ctx.stopping.load(.acquire)) return;
+
+        const osstatus = AudioQueueStart(q, null);
         if (osstatus == no_err) {
             break;
         }
@@ -444,13 +481,14 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
             continue;
         }
 
+        initialization_error = error.AudioQueueStartFailed;
         std.log.err("AudioQueueStart failed at newContext: {d}", .{osstatus});
         return;
     }
 
     ctx.mutex.lockUncancelable(std.Options.debug_io);
     ctx.ready = true;
-    ctx.condition.signal(std.Options.debug_io);
+    ctx.condition.broadcast(std.Options.debug_io);
     ctx.mutex.unlock(std.Options.debug_io);
     ready_closed = true;
 
@@ -459,20 +497,20 @@ fn audioContextWorker(ctx: *Context, sample_rate: u32, channel_count: u32) void 
 }
 
 fn render(user_data: ?*anyopaque, aq: AudioQueueRef, buffer: AudioQueueBufferRef) callconv(.c) void {
-    _ = user_data;
+    const ctx: *Context = @ptrCast(@alignCast(user_data orelse return));
     _ = aq;
 
-    context.mutex.lockUncancelable(std.Options.debug_io);
-    defer context.mutex.unlock(std.Options.debug_io);
+    ctx.mutex.lockUncancelable(std.Options.debug_io);
+    defer ctx.mutex.unlock(std.Options.debug_io);
 
     // Add the finished buffer back to the pool of available buffers
-    context.unqueued_buffers.append(buffer) catch |err| {
+    ctx.unqueued_buffers.append(buffer) catch |err| {
         std.log.err("Failed to append buffer in render callback: {}", .{err});
         return;
     };
 
     // Signal that a buffer is available
-    context.condition.signal(std.Options.debug_io);
+    ctx.condition.signal(std.Options.debug_io);
 }
 
 fn sleepTime(count: i32) u64 {
